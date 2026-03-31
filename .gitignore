@@ -1,0 +1,29 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.xcodeproj
+xcuserdata/
+
+# Swift Package Manager
+.build/
+Packages/
+*.resolved
+
+# Node
+node_modules/
+npm-debug.log*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+
+# Environment
+.env
+.env.local
