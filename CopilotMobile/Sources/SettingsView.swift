@@ -69,6 +69,12 @@ struct SettingsView: View {
                     }
                 }
 
+                Section("Terminal") {
+                    NavigationLink("Terminal Order") {
+                        TerminalOrderView()
+                    }
+                }
+
                 Section("How to Set Up") {
                     Link("View Setup Guide on GitHub", destination: URL(string: "https://github.com")!)
                     
@@ -137,6 +143,84 @@ struct SettingsView: View {
                     return
                 }
                 testResult = .success
+            }
+        }.resume()
+    }
+}
+
+struct TerminalOrderView: View {
+    @EnvironmentObject var settings: AppSettings
+    @State private var terminals: [String] = []
+    @State private var isLoading = false
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(terminals, id: \.self) { terminal in
+                    HStack {
+                        Image(systemName: terminalIcon(terminal))
+                            .foregroundStyle(.secondary)
+                        Text(terminal)
+                        if terminals.first == terminal {
+                            Spacer()
+                            Text("Preferred")
+                                .font(.caption2)
+                                .foregroundStyle(.blue)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Color.blue.opacity(0.1))
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+                .onMove { from, to in
+                    terminals.move(fromOffsets: from, toOffset: to)
+                    settings.terminalOrder = terminals
+                }
+            } footer: {
+                Text("First terminal in list is used when opening sessions from your phone.")
+            }
+        }
+        .environment(\.editMode, .constant(.active))
+        .navigationTitle("Terminal Order")
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button { fetchTerminals() } label: {
+                    if isLoading { ProgressView().scaleEffect(0.8) }
+                    else { Image(systemName: "arrow.clockwise") }
+                }
+            }
+        }
+        .onAppear { fetchTerminals() }
+    }
+
+    private func terminalIcon(_ name: String) -> String {
+        switch name {
+        case "Warp": return "terminal.fill"
+        case "Ghostty": return "terminal"
+        case "kitty": return "terminal"
+        case "iTerm2": return "terminal"
+        default: return "terminal"
+        }
+    }
+
+    private func fetchTerminals() {
+        guard !settings.serverURL.isEmpty, !settings.apiKey.isEmpty else { return }
+        isLoading = true
+        let urlStr = settings.serverURL.trimmingCharacters(in: .whitespaces)
+        guard let base = URL(string: urlStr) else { isLoading = false; return }
+        let encoded = settings.apiKey.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? settings.apiKey
+        let url = base.appendingPathComponent("api/terminals").absoluteString + "?key=\(encoded)"
+        guard let finalURL = URL(string: url) else { isLoading = false; return }
+        URLSession.shared.dataTask(with: finalURL) { data, _, _ in
+            DispatchQueue.main.async {
+                isLoading = false
+                guard let data,
+                      let json = try? JSONDecoder().decode([String: [String]].self, from: data),
+                      let detected = json["terminals"] else { return }
+                var merged = settings.terminalOrder.filter { detected.contains($0) }
+                for t in detected where !merged.contains(t) { merged.append(t) }
+                terminals = merged
+                settings.terminalOrder = merged
             }
         }.resume()
     }

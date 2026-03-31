@@ -6,6 +6,7 @@ final class TerminalWebSocketManager: ObservableObject {
     @Published var connectionError: String?
 
     var onMessage: ((WSMessage) -> Void)?
+    var onConnect: (() -> Void)?
 
     private var webSocket: URLSessionWebSocketTask?
     private let urlSession = URLSession(configuration: .default)
@@ -21,6 +22,7 @@ final class TerminalWebSocketManager: ObservableObject {
         webSocket = urlSession.webSocketTask(with: url)
         webSocket?.resume()
         isConnected = true
+        onConnect?()
         listen()
         startPing()
     }

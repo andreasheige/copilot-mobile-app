@@ -11,21 +11,49 @@ struct WSMessage: Codable {
     var tool: String?
     var args: [String: AnyCodable]?
     var hint: String?
+    var status: String?
     var cols: Int?
     var rows: Int?
+    var workDir: String?
+    var tmuxSession: String?
+    var startCommand: String?
+    var preferredTerminal: String?
 }
 
 // MARK: - Terminal
 
+enum SessionStatus: String {
+    case running, idle, stale, ended
+    var color: String {
+        switch self {
+        case .running: return "green"
+        case .idle: return "yellow"
+        case .stale: return "orange"
+        case .ended: return "red"
+        }
+    }
+    var label: String {
+        switch self {
+        case .running: return "Running"
+        case .idle: return "Idle"
+        case .stale: return "Stale"
+        case .ended: return "Ended"
+        }
+    }
+}
+
 struct TerminalSession: Identifiable {
     let id: String
+    var workDir: String = ""
     var output: String = ""
+    var status: SessionStatus = .idle
+    var lastActivityAt: Date = Date()
     let createdAt: Date = Date()
 }
 
 // MARK: - Agent
 
-struct AgentMessage: Identifiable {
+struct AgentMessage: Identifiable, Codable {
     let id: UUID
     let role: Role
     var content: String
@@ -33,9 +61,9 @@ struct AgentMessage: Identifiable {
     var isStreaming: Bool
     let timestamp: Date
 
-    enum Role { case user, assistant }
+    enum Role: Codable { case user, assistant }
 
-    struct ToolCall: Identifiable {
+    struct ToolCall: Identifiable, Codable {
         let id: UUID
         let tool: String
         var args: String
@@ -53,7 +81,7 @@ struct AgentMessage: Identifiable {
     }
 }
 
-struct AgentSession: Identifiable {
+struct AgentSession: Identifiable, Codable {
     let id: String
     var title: String = "New Chat"
     var messages: [AgentMessage] = []

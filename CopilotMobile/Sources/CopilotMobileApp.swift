@@ -17,6 +17,10 @@ final class AppContainer: ObservableObject {
             self?.terminalManager.handleMessage(msg)
             self?.agentManager.handleMessage(msg)
         }
+        // Re-subscribe all known sessions when connection is established
+        ws.onConnect = { [weak self] in
+            self?.terminalManager.resubscribeAll()
+        }
     }
 }
 
