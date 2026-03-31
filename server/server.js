@@ -239,7 +239,7 @@ function tmuxCmd(...args) {
   return execSync(`${TMUX} ${args.join(" ")}`, { encoding: "utf8" }).trim();
 }
 function capturePane(name) {
-  try { return execSync(`${TMUX} capture-pane -t ${name} -p -e`, { encoding: "utf8" }); }
+  try { return execSync(`${TMUX} capture-pane -t ${name} -p -e -S -500`, { encoding: "utf8" }); }
   catch { return null; }
 }
 function ensureTmux(name) {
@@ -335,6 +335,9 @@ wss.on("connection", (ws, req) => {
       // ── Terminal (tmux) ─────────────────────────────────────────────────────
       case "new_session": {
         const name = msg.tmuxSession || "mobile";
+        // Stop any existing poll loop for this session before starting a new one
+        const existing = terminalSessions.get(name);
+        if (existing) clearTimeout(existing.timer);
         const created = ensureTmux(name);
         terminalSessions.set(name, { ws, timer: null });
         startPolling(name, ws);
