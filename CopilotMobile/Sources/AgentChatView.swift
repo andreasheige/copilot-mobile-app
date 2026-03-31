@@ -14,14 +14,21 @@ struct AgentChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             messageList
-            Divider()
+            Divider().background(CopilotTheme.border)
             inputBar
         }
+        .background(CopilotTheme.background)
         .navigationTitle(session?.title ?? "Copilot")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(CopilotTheme.surface, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                if agentManager.isResponding { ProgressView().scaleEffect(0.8) }
+                if agentManager.isResponding {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                        .tint(CopilotTheme.accent)
+                }
             }
         }
     }
@@ -39,6 +46,7 @@ struct AgentChatView: View {
                 }
                 .padding()
             }
+            .background(CopilotTheme.background)
             .onAppear { scrollProxy = proxy }
             .onChange(of: session?.messages.count) { scrollToBottom() }
             .onChange(of: session?.messages.last?.content) { scrollToBottom() }
@@ -53,26 +61,28 @@ struct AgentChatView: View {
     // MARK: - Input
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        HStack(alignment: .bottom, spacing: 10) {
             TextField("Ask Copilot…", text: $inputText, axis: .vertical)
                 .textFieldStyle(.plain)
+                .foregroundStyle(CopilotTheme.textPrimary)
+                .tint(CopilotTheme.accentLight)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .background(CopilotTheme.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(CopilotTheme.border, lineWidth: 1))
                 .lineLimit(1...6)
-                .onSubmit { sendMessage() }
 
             Button(action: sendMessage) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 32))
-                    .foregroundStyle(canSend ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(canSend ? CopilotTheme.accent : CopilotTheme.textSecondary)
             }
             .disabled(!canSend)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(CopilotTheme.background)
     }
 
     private var canSend: Bool {
@@ -100,29 +110,52 @@ struct AgentMessageView: View {
                 HStack(spacing: 6) {
                     Image(systemName: toolIcon(tc.tool))
                         .font(.caption)
+                        .foregroundStyle(CopilotTheme.accentLight)
                     Text("Running `\(tc.tool)`")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ProgressView().scaleEffect(0.6)
+                        .foregroundStyle(CopilotTheme.textSecondary)
+                    ProgressView()
+                        .scaleEffect(0.6)
+                        .tint(CopilotTheme.accent)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(Color(.tertiarySystemBackground))
+                .padding(.vertical, 5)
+                .background(CopilotTheme.surface)
                 .clipShape(Capsule())
+                .overlay(Capsule().stroke(CopilotTheme.border, lineWidth: 1))
             }
 
             // Message content
             if !message.content.isEmpty || message.toolCalls.isEmpty {
-                HStack {
+                HStack(alignment: .top, spacing: 0) {
                     if message.role == .user { Spacer(minLength: 60) }
 
-                    Text(message.content.isEmpty && message.isStreaming ? "…" : message.content)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(message.role == .user ? Color.accentColor : Color(.secondarySystemBackground))
-                        .foregroundStyle(message.role == .user ? Color.white : Color.primary)
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                        .textSelection(.enabled)
+                    VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
+                        // Role label for assistant
+                        if message.role == .assistant {
+                            HStack(spacing: 4) {
+                                Image(systemName: "sparkles")
+                                    .font(.caption2)
+                                    .foregroundStyle(CopilotTheme.accent)
+                                Text("Copilot")
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(CopilotTheme.textSecondary)
+                            }
+                        }
+
+                        Text(message.content.isEmpty && message.isStreaming ? "…" : message.content)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(message.role == .user ? CopilotTheme.accent : CopilotTheme.surface)
+                            .foregroundStyle(message.role == .user ? Color.white : CopilotTheme.textPrimary)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                            .overlay(
+                                message.role == .assistant
+                                    ? RoundedRectangle(cornerRadius: 16).stroke(CopilotTheme.border, lineWidth: 1)
+                                    : nil
+                            )
+                            .textSelection(.enabled)
+                    }
 
                     if message.role == .assistant { Spacer(minLength: 60) }
                 }

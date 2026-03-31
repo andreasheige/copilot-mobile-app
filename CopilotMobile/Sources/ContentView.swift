@@ -59,23 +59,51 @@ struct AgentTab: View {
     }
 
     private var agentWelcome: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.system(size: 60))
-                .foregroundStyle(.tint)
-            Text("Copilot CLI").font(.title.bold())
-            Text("Ask me anything — I can run commands,\nedit files, and more on your Mac.")
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-            if ws.isConnected {
-                Button("New Chat") { agentManager.newSession() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-            } else {
-                Label("Connecting…", systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+        ZStack {
+            CopilotTheme.background.ignoresSafeArea()
+            VStack(spacing: 28) {
+                Spacer()
+                VStack(spacing: 16) {
+                    ZStack {
+                        Circle()
+                            .fill(CopilotTheme.accent.opacity(0.15))
+                            .frame(width: 80, height: 80)
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 36))
+                            .foregroundStyle(CopilotTheme.accent)
+                    }
+                    VStack(spacing: 6) {
+                        Text("GitHub Copilot")
+                            .font(.title2.bold())
+                            .foregroundStyle(CopilotTheme.textPrimary)
+                        Text("Ask me anything — I can run commands,\nedit files, and more on your Mac.")
+                            .font(.subheadline)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(CopilotTheme.textSecondary)
+                    }
+                }
+                if ws.isConnected {
+                    Button(action: { agentManager.newSession() }) {
+                        Label("New Chat", systemImage: "plus")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 28)
+                            .padding(.vertical, 13)
+                            .background(CopilotTheme.accent)
+                            .clipShape(Capsule())
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView().scaleEffect(0.75).tint(CopilotTheme.textSecondary)
+                        Text("Connecting…")
+                            .font(.subheadline)
+                            .foregroundStyle(CopilotTheme.textSecondary)
+                    }
+                }
+                Spacer()
             }
+            .padding()
         }
-        .padding()
     }
 }
 
@@ -92,23 +120,52 @@ struct TerminalTab: View {
         } detail: {
             if let session = terminalManager.activeSession {
                 TerminalView(sessionId: session.id)
+                    .id(session.id)
             } else {
-                VStack(spacing: 20) {
-                    Image(systemName: "terminal.fill")
-                        .font(.system(size: 60))
-                        .foregroundStyle(.tint)
-                    Text("Terminal").font(.title.bold())
-                    Text("Direct shell access to your Mac.\nOn your Mac: tmux attach -t mobile")
-                        .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
-                    if ws.isConnected {
-                        Button("New Session") { terminalManager.newSession() }
-                            .buttonStyle(.borderedProminent)
-                    } else {
-                        Label("Connecting…", systemImage: "wifi.exclamationmark").foregroundStyle(.secondary)
+                ZStack {
+                    CopilotTheme.background.ignoresSafeArea()
+                    VStack(spacing: 28) {
+                        Spacer()
+                        VStack(spacing: 16) {
+                            ZStack {
+                                Circle()
+                                    .fill(CopilotTheme.accent.opacity(0.15))
+                                    .frame(width: 80, height: 80)
+                                Image(systemName: "terminal.fill")
+                                    .font(.system(size: 34))
+                                    .foregroundStyle(CopilotTheme.accent)
+                            }
+                            VStack(spacing: 6) {
+                                Text("Terminal")
+                                    .font(.title2.bold())
+                                    .foregroundStyle(CopilotTheme.textPrimary)
+                                Text("Direct shell access to your Mac.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(CopilotTheme.textSecondary)
+                            }
+                        }
+                        if ws.isConnected {
+                            Button(action: { terminalManager.newSession() }) {
+                                Label("New Session", systemImage: "plus")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 28)
+                                    .padding(.vertical, 13)
+                                    .background(CopilotTheme.accent)
+                                    .clipShape(Capsule())
+                            }
+                        } else {
+                            HStack(spacing: 8) {
+                                ProgressView().scaleEffect(0.75).tint(CopilotTheme.textSecondary)
+                                Text("Connecting…")
+                                    .font(.subheadline)
+                                    .foregroundStyle(CopilotTheme.textSecondary)
+                            }
+                        }
+                        Spacer()
                     }
+                    .padding()
                 }
-                .padding()
             }
         }
     }

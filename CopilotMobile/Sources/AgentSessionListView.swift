@@ -12,11 +12,20 @@ struct AgentSessionListView: View {
         )) {
             ForEach(agentManager.sessions) { session in
                 NavigationLink(value: session.id) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(session.title).font(.headline).lineLimit(1)
-                        if let last = session.messages.last {
-                            Text(last.content.isEmpty ? "…" : last.content)
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 12) {
+                        Image(systemName: "bubble.left.fill")
+                            .foregroundStyle(CopilotTheme.accent)
+                            .font(.system(size: 16))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(session.title)
+                                .font(.body.weight(.medium))
+                                .lineLimit(1)
+                            if let last = session.messages.last {
+                                Text(last.content.isEmpty ? "…" : last.content)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                     .padding(.vertical, 2)
@@ -33,11 +42,23 @@ struct AgentSessionListView: View {
             }
             ToolbarItem(placement: .navigationBarTrailing) {
                 HStack(spacing: 10) {
-                    Circle().fill(ws.isConnected ? Color.green : Color.red).frame(width: 8, height: 8)
+                    connectionIndicator
                     Button { agentManager.newSession() } label: { Image(systemName: "square.and.pencil") }
                         .disabled(!ws.isConnected)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var connectionIndicator: some View {
+        ZStack {
+            Circle()
+                .fill(ws.isConnected ? CopilotTheme.success.opacity(0.25) : CopilotTheme.danger.opacity(0.25))
+                .frame(width: 14, height: 14)
+            Circle()
+                .fill(ws.isConnected ? CopilotTheme.success : CopilotTheme.danger)
+                .frame(width: 8, height: 8)
         }
     }
 }
