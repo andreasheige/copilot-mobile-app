@@ -1,0 +1,17 @@
+{
+  "name": "copilot-mobile-server",
+  "version": "1.0.0",
+  "description": "Backend server for Copilot Mobile iOS app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "node-pty": "^1.1.0",
+    "uuid": "^9.0.1",
+    "ws": "^8.17.0"
+  }
+}
