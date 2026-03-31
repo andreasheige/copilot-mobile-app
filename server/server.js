@@ -2,7 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const { execSync, exec } = require("child_process");
+const { execSync, execFileSync, exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -19,6 +19,7 @@ const MODEL = process.env.MODEL || "gpt-4o";
 const AGENT_API_URL = process.env.COPILOT_API_URL || "https://models.inference.ai.azure.com/chat/completions";
 const TMUX = process.env.TMUX_BIN || "/opt/homebrew/bin/tmux";
 const WORK_DIR = process.env.WORK_DIR || os.homedir();
+const DEFAULT_START_COMMAND = process.env.DEFAULT_START_COMMAND || "";
 
 if (!API_KEY || API_KEY === "change_me_to_a_strong_random_secret") {
   console.error("❌  API_KEY not set in .env"); process.exit(1);
@@ -34,12 +35,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "bash",
-      description: "Run a shell command on the Mac and return its output. Use for running scripts, git, gh copilot, file operations, etc.",
+      description: "Run any shell command on the Mac (zsh). Use for git, npm, python, compiling, etc. Prefer specific tools below when they fit.",
       parameters: {
         type: "object",
         properties: {
           command: { type: "string", description: "The shell command to run" },
-          timeout: { type: "number", description: "Timeout in seconds (default 30)" },
+          timeout: { type: "number", description: "Timeout in seconds (default 30, max 120)" },
+          cwd: { type: "string", description: "Working directory (default: WORK_DIR)" },
         },
         required: ["command"],
       },
@@ -49,11 +51,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read the contents of a file on the Mac.",
+      description: "Read the contents of a file.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Absolute or relative path to the file" },
+          path: { type: "string", description: "File path (absolute or relative to WORK_DIR)" },
+          start_line: { type: "number", description: "First line to read (1-indexed, optional)" },
+          end_line: { type: "number", description: "Last line to read (optional)" },
         },
         required: ["path"],
       },
@@ -63,12 +67,12 @@ const TOOLS = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Write or overwrite a file on the Mac.",
+      description: "Create or overwrite a file.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Absolute or relative path to the file" },
-          content: { type: "string", description: "Content to write" },
+          path: { type: "string", description: "File path" },
+          content: { type: "string", description: "Full file content" },
         },
         required: ["path", "content"],
       },
@@ -78,12 +82,74 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_dir",
-      description: "List files and directories at a given path.",
+      description: "List files and directories at a path.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Directory path (default: home directory)" },
+          path: { type: "string", description: "Directory path (default: WORK_DIR)" },
+          recursive: { type: "boolean", description: "List recursively (default false)" },
         },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_files",
+      description: "Search for files by name pattern using glob.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Glob pattern, e.g. '**/*.swift' or 'src/*.js'" },
+          cwd: { type: "string", description: "Directory to search in (default: WORK_DIR)" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_in_files",
+      description: "Search for text/regex inside files (like grep). Returns matching lines with file and line number.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Search pattern (regex supported)" },
+          path: { type: "string", description: "File or directory to search in (default: WORK_DIR)" },
+          file_glob: { type: "string", description: "Filter files by glob, e.g. '*.js'" },
+          case_sensitive: { type: "boolean", description: "Case sensitive (default true)" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "github",
+      description: "Run GitHub CLI (gh) commands: list issues/PRs, view repos, create PRs, check workflow runs, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          args: { type: "string", description: "Arguments to pass to gh, e.g. 'issue list', 'pr create --title ...", },
+        },
+        required: ["args"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the web and return top results. Use for docs, error messages, latest versions, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          max_results: { type: "number", description: "Max results to return (default 5)" },
+        },
+        required: ["query"],
       },
     },
   },
@@ -93,34 +159,97 @@ const TOOLS = [
 
 function executeTool(name, args) {
   try {
+    const cwd = args.cwd ? path.resolve(WORK_DIR, args.cwd) : WORK_DIR;
     switch (name) {
+
       case "bash": {
-        const timeout = (args.timeout || 30) * 1000;
+        const timeout = Math.min((args.timeout || 30), 120) * 1000;
         try {
           const output = execSync(args.command, {
-            encoding: "utf8", timeout, cwd: WORK_DIR,
+            encoding: "utf8", timeout, cwd,
             env: { ...process.env, TERM: "xterm-256color" },
           });
-          return output || "(no output)";
+          return output.trim() || "(no output)";
         } catch (e) {
-          return `Exit ${e.status || 1}:\n${e.stdout || ""}${e.stderr || e.message}`;
+          return `Exit ${e.status || 1}:\n${(e.stdout || "").trim()}\n${(e.stderr || e.message).trim()}`.trim();
         }
       }
+
       case "read_file": {
         const filePath = path.resolve(WORK_DIR, args.path);
-        return fs.readFileSync(filePath, "utf8");
+        const content = fs.readFileSync(filePath, "utf8");
+        if (args.start_line || args.end_line) {
+          const lines = content.split("\n");
+          const start = (args.start_line || 1) - 1;
+          const end = args.end_line || lines.length;
+          return lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join("\n");
+        }
+        return content;
       }
+
       case "write_file": {
         const filePath = path.resolve(WORK_DIR, args.path);
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
         fs.writeFileSync(filePath, args.content, "utf8");
-        return `Written ${args.content.length} chars to ${filePath}`;
+        return `✅ Written to ${filePath} (${args.content.length} chars)`;
       }
+
       case "list_dir": {
         const dirPath = path.resolve(WORK_DIR, args.path || ".");
+        if (args.recursive) {
+          return execSync(`find "${dirPath}" -maxdepth 4 | sort`, { encoding: "utf8" }).trim();
+        }
         const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-        return entries.map(e => (e.isDirectory() ? `📁 ${e.name}/` : `📄 ${e.name}`)).join("\n");
+        return entries.map(e => e.isDirectory() ? `📁 ${e.name}/` : `📄 ${e.name}`).join("\n");
       }
+
+      case "find_files": {
+        const searchDir = path.resolve(WORK_DIR, args.cwd || ".");
+        const result = execSync(`find "${searchDir}" -name "${args.pattern}" 2>/dev/null | head -50`, { encoding: "utf8" });
+        return result.trim() || "No files found";
+      }
+
+      case "search_in_files": {
+        const searchPath = path.resolve(WORK_DIR, args.path || ".");
+        const flags = ["-r", "-n", args.case_sensitive === false ? "-i" : ""].filter(Boolean).join(" ");
+        const globFlag = args.file_glob ? `--include="${args.file_glob}"` : "";
+        try {
+          return execSync(`grep ${flags} ${globFlag} "${args.pattern}" "${searchPath}" 2>/dev/null | head -50`, { encoding: "utf8" }).trim() || "No matches";
+        } catch { return "No matches"; }
+      }
+
+      case "github": {
+        try {
+          return execSync(`gh ${args.args}`, {
+            encoding: "utf8", timeout: 30000, cwd: WORK_DIR,
+            env: { ...process.env, GH_TOKEN: GITHUB_TOKEN },
+          }).trim();
+        } catch (e) {
+          return `gh error: ${(e.stderr || e.message).trim()}`;
+        }
+      }
+
+      case "web_search": {
+        const max = args.max_results || 5;
+        const encoded = encodeURIComponent(args.query);
+        try {
+          // DuckDuckGo instant answer API (no key needed)
+          const ddg = execSync(
+            `curl -s "https://api.duckduckgo.com/?q=${encoded}&format=json&no_redirect=1&no_html=1&skip_disambig=1"`,
+            { encoding: "utf8", timeout: 10000 }
+          );
+          const data = JSON.parse(ddg);
+          const results = [];
+          if (data.AbstractText) results.push(`📌 ${data.AbstractText}\n   Source: ${data.AbstractURL}`);
+          (data.RelatedTopics || []).slice(0, max - 1).forEach(t => {
+            if (t.Text) results.push(`• ${t.Text}${t.FirstURL ? `\n  ${t.FirstURL}` : ""}`);
+          });
+          return results.length ? results.join("\n\n") : `No instant answer. Try: https://duckduckgo.com/?q=${encoded}`;
+        } catch (e) {
+          return `Search failed: ${e.message}`;
+        }
+      }
+
       default:
         return `Unknown tool: ${name}`;
     }
@@ -132,10 +261,34 @@ function executeTool(name, args) {
 // ─── Agent loop ───────────────────────────────────────────────────────────────
 
 async function runAgent(history, onChunk, onToolCall) {
+  // Build rich system context
+  let gitContext = "";
+  try { gitContext = execSync("git -C " + WORK_DIR + " log --oneline -3 2>/dev/null && git -C " + WORK_DIR + " status --short 2>/dev/null", { encoding: "utf8", timeout: 3000 }).trim(); } catch {}
+
   const messages = [
     {
       role: "system",
-      content: `You are GitHub Copilot CLI, an AI assistant running on the user's Mac (${os.hostname()}). You have tools to run shell commands, read/write files, and list directories. Working directory: ${WORK_DIR}. Be concise and helpful. When running commands, show the output.`,
+      content: [
+        `You are GitHub Copilot CLI, a powerful AI developer assistant running on the user's Mac.`,
+        ``,
+        `## Environment`,
+        `- Hostname: ${os.hostname()}`,
+        `- User: ${os.userInfo().username}`,
+        `- OS: macOS ${os.release()}`,
+        `- Working directory: ${WORK_DIR}`,
+        `- Shell: zsh`,
+        gitContext ? `- Git context:\n${gitContext}` : "",
+        ``,
+        `## Capabilities`,
+        `You have tools to: run shell commands, read/write files, search files, run GitHub CLI commands, and search the web.`,
+        `Use @workspace to focus on the current project, @terminal to run commands, @github for GitHub operations.`,
+        ``,
+        `## Guidelines`,
+        `- Be concise but thorough. Show command output when relevant.`,
+        `- For code changes, read the file first, then write the full updated content.`,
+        `- Use web_search for docs, error messages, or anything requiring up-to-date info.`,
+        `- Chain tools naturally: search → read → edit → verify.`,
+      ].filter(Boolean).join("\n"),
     },
     ...history,
   ];
@@ -235,33 +388,107 @@ const terminalSessions = new Map(); // tmuxSession -> { ws, timer }
 
 // ─── Tmux helpers ─────────────────────────────────────────────────────────────
 
+const PARENT = "copilot-mobile";  // all windows live inside this tmux session
+
 function tmuxCmd(...args) {
-  return execSync(`${TMUX} ${args.join(" ")}`, { encoding: "utf8" }).trim();
+  return execFileSync(TMUX, args, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
 }
+
+// target string for a named window: "copilot-mobile:windowname"
+function target(name) { return `${PARENT}:${name}`; }
+
 function capturePane(name) {
-  try { return execSync(`${TMUX} capture-pane -t ${name} -p -e -S -500`, { encoding: "utf8" }); }
+  try { return execFileSync(TMUX, ["capture-pane", "-t", target(name), "-p", "-e", "-S", "-500"], { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }); }
   catch { return null; }
 }
-function ensureTmux(name) {
-  try { tmuxCmd("has-session", "-t", name); return false; }
-  catch { tmuxCmd("new-session", "-d", "-s", name, "-x", "220", "-y", "50"); return true; }
+
+function ensureParentSession() {
+  try { tmuxCmd("has-session", "-t", PARENT); return false; }
+  catch {
+    tmuxCmd("new-session", "-d", "-s", PARENT, "-x", "220", "-y", "50");
+    return true; // newly created
+  }
+}
+
+function openTerminalAttached(preferred) {
+  const scriptPath = "/tmp/copilot-mobile-attach.sh";
+  fs.writeFileSync(scriptPath, `#!/bin/bash\nexec ${TMUX} attach -t ${PARENT}\n`, { mode: 0o755 });
+  try {
+    const lsinfo = execSync("lsappinfo list 2>/dev/null", { encoding: "utf8" });
+    const frontmostMatch = lsinfo.match(/"([^"]+)"\s+ASN:[^:]+:\s*\(in front\)/);
+    const frontmost = frontmostMatch ? frontmostMatch[1] : "";
+    const isRunning = (name) => lsinfo.includes(`"${name}" ASN:`);
+
+    console.log(`[terminal] Frontmost: "${frontmost}", Preferred: "${preferred || "none"}"`);
+
+    const tryOpen = (appName) => execSync(`open -a "${appName}" "${scriptPath}"`);
+    const TERMINALS = ["Warp", "Ghostty", "kitty", "iTerm2", "Terminal"];
+
+    // If preferred is set and is installed/running, use it
+    if (preferred && (isRunning(preferred) || TERMINALS.includes(preferred))) {
+      try { tryOpen(preferred); return; } catch {}
+    }
+    // Try frontmost if it's a terminal
+    if (TERMINALS.includes(frontmost)) { try { tryOpen(frontmost); return; } catch {} }
+    // Try any running terminal in default order
+    const running = TERMINALS.find(t => isRunning(t));
+    if (running) { tryOpen(running); return; }
+    execSync(`open -a "Terminal" "${scriptPath}"`);
+  } catch (e) {
+    console.warn("Could not auto-open terminal:", e.message);
+  }
+}
+
+function ensureTmux(name, cwd, preferred, startCommand) {
+  const parentCreated = ensureParentSession();
+  if (parentCreated) openTerminalAttached(preferred);
+  try {
+    tmuxCmd("select-window", "-t", target(name));
+    return false;
+  } catch {
+    const resolvedCwd = cwd ? cwd.replace(/^~/, process.env.HOME) : process.env.HOME;
+    tmuxCmd("new-window", "-t", PARENT, "-n", name, "-c", resolvedCwd);
+    if (startCommand) {
+      // Small delay to let shell initialize before sending command
+      setTimeout(() => {
+        try { tmuxCmd("send-keys", "-t", target(name), startCommand, "Enter"); } catch {}
+      }, 800);
+    }
+    return true;
+  }
 }
 function startPolling(name, ws) {
   let last = "";
+  let lastChangeAt = Date.now();
+
+  const getStatus = () => {
+    const age = Date.now() - lastChangeAt;
+    if (age < 3000) return "running";      // changed in last 3s
+    if (age < 60000) return "idle";        // changed in last minute
+    return "stale";                        // no activity > 1 min
+  };
+
   const poll = () => {
     if (!terminalSessions.has(name)) return;
     const content = capturePane(name);
     if (content === null) {
       if (ws.readyState === ws.OPEN)
-        ws.send(JSON.stringify({ type: "screen", sessionId: name, data: "\r\n[Session ended]\r\n" }));
+        ws.send(JSON.stringify({ type: "screen", sessionId: name, data: "\r\n[Session ended]\r\n", status: "ended" }));
       terminalSessions.delete(name);
       return;
     }
+    const status = getStatus();
     if (content !== last) {
+      lastChangeAt = Date.now();
       if (ws.readyState === ws.OPEN)
-        ws.send(JSON.stringify({ type: "screen", sessionId: name, data: content }));
+        ws.send(JSON.stringify({ type: "screen", sessionId: name, data: content, status: "running" }));
       last = content;
+    } else if (terminalSessions.get(name)?.lastStatus !== status) {
+      // Status changed even though content didn't — notify
+      if (ws.readyState === ws.OPEN)
+        ws.send(JSON.stringify({ type: "status", sessionId: name, status }));
     }
+    if (terminalSessions.has(name)) terminalSessions.get(name).lastStatus = status;
     terminalSessions.get(name).timer = setTimeout(poll, 150);
   };
   poll();
@@ -334,11 +561,13 @@ wss.on("connection", (ws, req) => {
 
       // ── Terminal (tmux) ─────────────────────────────────────────────────────
       case "new_session": {
-        const name = msg.tmuxSession || "mobile";
-        // Stop any existing poll loop for this session before starting a new one
+        const name = msg.tmuxSession || msg.sessionId || "mobile";
+        const workDir = msg.workDir || null;
+        const preferred = msg.preferredTerminal || null;
+        const startCommand = msg.startCommand || DEFAULT_START_COMMAND || null;
         const existing = terminalSessions.get(name);
         if (existing) clearTimeout(existing.timer);
-        const created = ensureTmux(name);
+        const created = ensureTmux(name, workDir, preferred, startCommand);
         terminalSessions.set(name, { ws, timer: null });
         startPolling(name, ws);
         send({ type: "session_created", sessionId: name, created });
@@ -354,13 +583,13 @@ wss.on("connection", (ws, req) => {
         }
         const data = msg.data || "";
         try {
-          if (data === "\u0003") tmuxCmd("send-keys", "-t", sid, "C-c");
-          else if (data === "\t") tmuxCmd("send-keys", "-t", sid, "Tab");
+          if (data === "\u0003") tmuxCmd("send-keys", "-t", target(sid), "C-c");
+          else if (data === "\t") tmuxCmd("send-keys", "-t", target(sid), "Tab");
           else {
             const text = data.replace(/[\r\n]+$/, "");
             const hasNl = data !== text;
-            if (text) { const esc = text.replace(/'/g, "'\\''"); tmuxCmd("send-keys", "-t", sid, `'${esc}'`); }
-            if (hasNl) tmuxCmd("send-keys", "-t", sid, "Enter");
+            if (text) { const esc = text.replace(/'/g, "'\\''"); tmuxCmd("send-keys", "-t", target(sid), `'${esc}'`); }
+            if (hasNl) tmuxCmd("send-keys", "-t", target(sid), "Enter");
           }
         } catch (e) { send({ type: "error", message: e.message }); }
         break;
@@ -385,6 +614,23 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+app.get("/api/terminals", (req, res) => {
+  if (req.query.key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  const KNOWN = [
+    { name: "Warp",     bundle: "Warp.app" },
+    { name: "Ghostty",  bundle: "Ghostty.app" },
+    { name: "kitty",    bundle: "kitty.app" },
+    { name: "iTerm2",   bundle: "iTerm.app" },
+    { name: "Terminal", bundle: "Terminal.app" },
+  ];
+  const isInstalled = (bundle) => {
+    const paths = [`/Applications/${bundle}`, `/System/Applications/${bundle}`, `/System/Applications/Utilities/${bundle}`];
+    return paths.some(p => { try { fs.accessSync(p); return true; } catch { return false; } });
+  };
+  const terminals = KNOWN.filter(t => isInstalled(t.bundle)).map(t => t.name);
+  res.json({ terminals });
+});
+
 app.get("/health", (req, res) => {
   res.json({ status: "ok", model: MODEL, agentSessions: agentSessions.size, terminalSessions: terminalSessions.size, uptime: process.uptime() });
 });
@@ -394,4 +640,14 @@ server.listen(PORT, () => {
   console.log(`\n🚀 Copilot CLI Server on port ${PORT}`);
   console.log(`   Model: ${MODEL}  |  Work dir: ${WORK_DIR}`);
   console.log(`   Health: http://localhost:${PORT}/health\n`);
+
+  // Auto-create default "copilot" session on startup
+  if (DEFAULT_START_COMMAND) {
+    try {
+      ensureTmux("copilot", WORK_DIR, null, DEFAULT_START_COMMAND);
+      console.log(`   Auto-started session "copilot" with: ${DEFAULT_START_COMMAND}`);
+    } catch (e) {
+      console.warn("   Could not auto-start session:", e.message);
+    }
+  }
 });
