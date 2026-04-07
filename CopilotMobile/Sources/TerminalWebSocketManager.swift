@@ -11,15 +11,15 @@ final class TerminalWebSocketManager: ObservableObject {
     private var webSocket: URLSessionWebSocketTask?
     private let urlSession = URLSession(configuration: .default)
     private var pingTask: Task<Void, Never>?
-    private var reconnectURL: URL?
+    private var reconnectRequest: URLRequest?
     private var reconnectTask: Task<Void, Never>?
 
-    func connect(to url: URL) {
-        reconnectURL = url
+    func connect(to request: URLRequest) {
+        reconnectRequest = request
         reconnectTask?.cancel()
         disconnect(clearURL: false)
         connectionError = nil
-        webSocket = urlSession.webSocketTask(with: url)
+        webSocket = urlSession.webSocketTask(with: request)
         webSocket?.resume()
         isConnected = true
         onConnect?()
@@ -33,7 +33,7 @@ final class TerminalWebSocketManager: ObservableObject {
         webSocket?.cancel(with: .normalClosure, reason: nil)
         webSocket = nil
         isConnected = false
-        if clearURL { reconnectURL = nil }
+        if clearURL { reconnectRequest = nil }
     }
 
     func send(_ msg: WSMessage) {
@@ -93,11 +93,11 @@ final class TerminalWebSocketManager: ObservableObject {
     }
 
     private func scheduleReconnect() {
-        guard let url = reconnectURL else { return }
+        guard let request = reconnectRequest else { return }
         reconnectTask?.cancel()
         reconnectTask = Task {
             try? await Task.sleep(for: .seconds(3))
-            if !Task.isCancelled { connect(to: url) }
+            if !Task.isCancelled { connect(to: request) }
         }
     }
 }

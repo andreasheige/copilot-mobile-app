@@ -39,8 +39,8 @@ class AppSettings: ObservableObject {
         if recentStartCommands.count > 5 { recentStartCommands = Array(recentStartCommands.prefix(5)) }
     }
 
-    /// Converts http(s):// URL to ws(s):// with API key query param
-    var wsURL: URL? {
+    /// Converts http(s):// URL to ws(s):// and builds a URLRequest with API key in header.
+    var wsRequest: URLRequest? {
         var urlString = serverURL.trimmingCharacters(in: .whitespaces)
         if urlString.hasPrefix("https://") {
             urlString = "wss://" + urlString.dropFirst("https://".count)
@@ -48,7 +48,9 @@ class AppSettings: ObservableObject {
             urlString = "ws://" + urlString.dropFirst("http://".count)
         }
         if urlString.hasSuffix("/") { urlString = String(urlString.dropLast()) }
-        let encoded = apiKey.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? apiKey
-        return URL(string: "\(urlString)?key=\(encoded)")
+        guard let url = URL(string: urlString) else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        return request
     }
 }

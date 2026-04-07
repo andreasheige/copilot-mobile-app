@@ -16,16 +16,67 @@ const wss = new WebSocketServer({ server });
 const API_KEY = process.env.API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const MODEL = process.env.MODEL || "gpt-4o";
-const AGENT_API_URL = process.env.COPILOT_API_URL || "https://models.inference.ai.azure.com/chat/completions";
+const AGENT_API_URL =
+  process.env.COPILOT_API_URL ||
+  "https://models.inference.ai.azure.com/chat/completions";
 const TMUX = process.env.TMUX_BIN || "/opt/homebrew/bin/tmux";
 const WORK_DIR = process.env.WORK_DIR || os.homedir();
 const DEFAULT_START_COMMAND = process.env.DEFAULT_START_COMMAND || "";
 
 if (!API_KEY || API_KEY === "change_me_to_a_strong_random_secret") {
-  console.error("❌  API_KEY not set in .env"); process.exit(1);
+  console.error("❌  API_KEY not set in .env");
+  process.exit(1);
 }
 if (!GITHUB_TOKEN) {
-  console.error("❌  GITHUB_TOKEN not set in .env"); process.exit(1);
+  console.error("❌  GITHUB_TOKEN not set in .env");
+  process.exit(1);
+}
+
+// ─── Security helpers ─────────────────────────────────────────────────────────
+
+/** Resolve a path and ensure it stays within WORK_DIR (prevents path traversal). */
+function safePath(userPath) {
+  const resolved = path.resolve(WORK_DIR, userPath);
+  const normalizedWork = path.resolve(WORK_DIR) + path.sep;
+  const normalizedResolved = path.resolve(resolved);
+  if (
+    normalizedResolved !== path.resolve(WORK_DIR) &&
+    !normalizedResolved.startsWith(normalizedWork)
+  ) {
+    throw new Error(`Path traversal blocked: ${userPath}`);
+  }
+  return normalizedResolved;
+}
+
+/** Extract API key from header (preferred) or query param (legacy). */
+function extractApiKey(req) {
+  return (
+    req.headers["x-api-key"] ||
+    new URL(req.url, "http://localhost").searchParams.get("key")
+  );
+}
+
+/** Simple in-memory rate limiter per IP. */
+const rateLimitMap = new Map();
+function rateLimit(ip, maxPerMinute = 60) {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip) || { count: 0, resetAt: now + 60000 };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + 60000;
+  }
+  entry.count++;
+  rateLimitMap.set(ip, entry);
+  return entry.count > maxPerMinute;
+}
+
+/** Build a sanitised env for the bash tool (strips secrets). */
+function cleanEnvForBash(cwd) {
+  const env = { ...process.env, TERM: "xterm-256color" };
+  delete env.GITHUB_TOKEN;
+  delete env.API_KEY;
+  delete env.GH_TOKEN;
+  return env;
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -35,13 +86,20 @@ const TOOLS = [
     type: "function",
     function: {
       name: "bash",
-      description: "Run any shell command on the Mac (zsh). Use for git, npm, python, compiling, etc. Prefer specific tools below when they fit.",
+      description:
+        "Run any shell command on the Mac (zsh). Use for git, npm, python, compiling, etc. Prefer specific tools below when they fit.",
       parameters: {
         type: "object",
         properties: {
           command: { type: "string", description: "The shell command to run" },
-          timeout: { type: "number", description: "Timeout in seconds (default 30, max 120)" },
-          cwd: { type: "string", description: "Working directory (default: WORK_DIR)" },
+          timeout: {
+            type: "number",
+            description: "Timeout in seconds (default 30, max 120)",
+          },
+          cwd: {
+            type: "string",
+            description: "Working directory (default: WORK_DIR)",
+          },
         },
         required: ["command"],
       },
@@ -55,9 +113,18 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "File path (absolute or relative to WORK_DIR)" },
-          start_line: { type: "number", description: "First line to read (1-indexed, optional)" },
-          end_line: { type: "number", description: "Last line to read (optional)" },
+          path: {
+            type: "string",
+            description: "File path (absolute or relative to WORK_DIR)",
+          },
+          start_line: {
+            type: "number",
+            description: "First line to read (1-indexed, optional)",
+          },
+          end_line: {
+            type: "number",
+            description: "Last line to read (optional)",
+          },
         },
         required: ["path"],
       },
@@ -86,8 +153,14 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Directory path (default: WORK_DIR)" },
-          recursive: { type: "boolean", description: "List recursively (default false)" },
+          path: {
+            type: "string",
+            description: "Directory path (default: WORK_DIR)",
+          },
+          recursive: {
+            type: "boolean",
+            description: "List recursively (default false)",
+          },
         },
       },
     },
@@ -100,8 +173,14 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {
-          pattern: { type: "string", description: "Glob pattern, e.g. '**/*.swift' or 'src/*.js'" },
-          cwd: { type: "string", description: "Directory to search in (default: WORK_DIR)" },
+          pattern: {
+            type: "string",
+            description: "Glob pattern, e.g. '**/*.swift' or 'src/*.js'",
+          },
+          cwd: {
+            type: "string",
+            description: "Directory to search in (default: WORK_DIR)",
+          },
         },
         required: ["pattern"],
       },
@@ -111,14 +190,27 @@ const TOOLS = [
     type: "function",
     function: {
       name: "search_in_files",
-      description: "Search for text/regex inside files (like grep). Returns matching lines with file and line number.",
+      description:
+        "Search for text/regex inside files (like grep). Returns matching lines with file and line number.",
       parameters: {
         type: "object",
         properties: {
-          pattern: { type: "string", description: "Search pattern (regex supported)" },
-          path: { type: "string", description: "File or directory to search in (default: WORK_DIR)" },
-          file_glob: { type: "string", description: "Filter files by glob, e.g. '*.js'" },
-          case_sensitive: { type: "boolean", description: "Case sensitive (default true)" },
+          pattern: {
+            type: "string",
+            description: "Search pattern (regex supported)",
+          },
+          path: {
+            type: "string",
+            description: "File or directory to search in (default: WORK_DIR)",
+          },
+          file_glob: {
+            type: "string",
+            description: "Filter files by glob, e.g. '*.js'",
+          },
+          case_sensitive: {
+            type: "boolean",
+            description: "Case sensitive (default true)",
+          },
         },
         required: ["pattern"],
       },
@@ -128,11 +220,16 @@ const TOOLS = [
     type: "function",
     function: {
       name: "github",
-      description: "Run GitHub CLI (gh) commands: list issues/PRs, view repos, create PRs, check workflow runs, etc.",
+      description:
+        "Run GitHub CLI (gh) commands: list issues/PRs, view repos, create PRs, check workflow runs, etc.",
       parameters: {
         type: "object",
         properties: {
-          args: { type: "string", description: "Arguments to pass to gh, e.g. 'issue list', 'pr create --title ...", },
+          args: {
+            type: "string",
+            description:
+              "Arguments to pass to gh, e.g. 'issue list', 'pr create --title ...",
+          },
         },
         required: ["args"],
       },
@@ -142,12 +239,16 @@ const TOOLS = [
     type: "function",
     function: {
       name: "web_search",
-      description: "Search the web and return top results. Use for docs, error messages, latest versions, etc.",
+      description:
+        "Search the web and return top results. Use for docs, error messages, latest versions, etc.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Search query" },
-          max_results: { type: "number", description: "Max results to return (default 5)" },
+          max_results: {
+            type: "number",
+            description: "Max results to return (default 5)",
+          },
         },
         required: ["query"],
       },
@@ -161,13 +262,14 @@ function executeTool(name, args) {
   try {
     const cwd = args.cwd ? path.resolve(WORK_DIR, args.cwd) : WORK_DIR;
     switch (name) {
-
       case "bash": {
-        const timeout = Math.min((args.timeout || 30), 120) * 1000;
+        const timeout = Math.min(args.timeout || 30, 120) * 1000;
         try {
           const output = execSync(args.command, {
-            encoding: "utf8", timeout, cwd,
-            env: { ...process.env, TERM: "xterm-256color" },
+            encoding: "utf8",
+            timeout,
+            cwd,
+            env: cleanEnvForBash(cwd),
           });
           return output.trim() || "(no output)";
         } catch (e) {
@@ -176,52 +278,92 @@ function executeTool(name, args) {
       }
 
       case "read_file": {
-        const filePath = path.resolve(WORK_DIR, args.path);
+        const filePath = safePath(args.path);
         const content = fs.readFileSync(filePath, "utf8");
         if (args.start_line || args.end_line) {
           const lines = content.split("\n");
           const start = (args.start_line || 1) - 1;
           const end = args.end_line || lines.length;
-          return lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join("\n");
+          return lines
+            .slice(start, end)
+            .map((l, i) => `${start + i + 1}: ${l}`)
+            .join("\n");
         }
         return content;
       }
 
       case "write_file": {
-        const filePath = path.resolve(WORK_DIR, args.path);
+        const filePath = safePath(args.path);
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
         fs.writeFileSync(filePath, args.content, "utf8");
         return `✅ Written to ${filePath} (${args.content.length} chars)`;
       }
 
       case "list_dir": {
-        const dirPath = path.resolve(WORK_DIR, args.path || ".");
+        const dirPath = safePath(args.path || ".");
         if (args.recursive) {
-          return execSync(`find "${dirPath}" -maxdepth 4 | sort`, { encoding: "utf8" }).trim();
+          return execFileSync("find", [dirPath, "-maxdepth", "4"], {
+            encoding: "utf8",
+          })
+            .split("\n")
+            .sort()
+            .join("\n")
+            .trim();
         }
         const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-        return entries.map(e => e.isDirectory() ? `📁 ${e.name}/` : `📄 ${e.name}`).join("\n");
+        return entries
+          .map((e) => (e.isDirectory() ? `📁 ${e.name}/` : `📄 ${e.name}`))
+          .join("\n");
       }
 
       case "find_files": {
-        const searchDir = path.resolve(WORK_DIR, args.cwd || ".");
-        const result = execSync(`find "${searchDir}" -name "${args.pattern}" 2>/dev/null | head -50`, { encoding: "utf8" });
-        return result.trim() || "No files found";
+        const searchDir = safePath(args.cwd || ".");
+        const pattern = String(args.pattern).replace(
+          /[^a-zA-Z0-9_.*?\[\]-]/g,
+          "",
+        ); // sanitise glob
+        try {
+          const result = execFileSync(
+            "find",
+            [searchDir, "-name", pattern, "-maxdepth", "10"],
+            { encoding: "utf8", timeout: 15000 },
+          );
+          return (
+            result.split("\n").filter(Boolean).slice(0, 50).join("\n") ||
+            "No files found"
+          );
+        } catch {
+          return "No files found";
+        }
       }
 
       case "search_in_files": {
-        const searchPath = path.resolve(WORK_DIR, args.path || ".");
-        const flags = ["-r", "-n", args.case_sensitive === false ? "-i" : ""].filter(Boolean).join(" ");
-        const globFlag = args.file_glob ? `--include="${args.file_glob}"` : "";
+        const searchPath = safePath(args.path || ".");
+        const grepArgs = ["-r", "-n"];
+        if (args.case_sensitive === false) grepArgs.push("-i");
+        if (args.file_glob) grepArgs.push(`--include=${args.file_glob}`);
+        grepArgs.push("--", String(args.pattern), searchPath);
         try {
-          return execSync(`grep ${flags} ${globFlag} "${args.pattern}" "${searchPath}" 2>/dev/null | head -50`, { encoding: "utf8" }).trim() || "No matches";
-        } catch { return "No matches"; }
+          const result = execFileSync("grep", grepArgs, {
+            encoding: "utf8",
+            timeout: 15000,
+          });
+          return (
+            result.split("\n").filter(Boolean).slice(0, 50).join("\n") ||
+            "No matches"
+          );
+        } catch {
+          return "No matches";
+        }
       }
 
       case "github": {
         try {
-          return execSync(`gh ${args.args}`, {
-            encoding: "utf8", timeout: 30000, cwd: WORK_DIR,
+          const ghArgs = String(args.args).split(/\s+/);
+          return execFileSync("gh", ghArgs, {
+            encoding: "utf8",
+            timeout: 30000,
+            cwd: WORK_DIR,
             env: { ...process.env, GH_TOKEN: GITHUB_TOKEN },
           }).trim();
         } catch (e) {
@@ -236,15 +378,23 @@ function executeTool(name, args) {
           // DuckDuckGo instant answer API (no key needed)
           const ddg = execSync(
             `curl -s "https://api.duckduckgo.com/?q=${encoded}&format=json&no_redirect=1&no_html=1&skip_disambig=1"`,
-            { encoding: "utf8", timeout: 10000 }
+            { encoding: "utf8", timeout: 10000 },
           );
           const data = JSON.parse(ddg);
           const results = [];
-          if (data.AbstractText) results.push(`📌 ${data.AbstractText}\n   Source: ${data.AbstractURL}`);
-          (data.RelatedTopics || []).slice(0, max - 1).forEach(t => {
-            if (t.Text) results.push(`• ${t.Text}${t.FirstURL ? `\n  ${t.FirstURL}` : ""}`);
+          if (data.AbstractText)
+            results.push(
+              `📌 ${data.AbstractText}\n   Source: ${data.AbstractURL}`,
+            );
+          (data.RelatedTopics || []).slice(0, max - 1).forEach((t) => {
+            if (t.Text)
+              results.push(
+                `• ${t.Text}${t.FirstURL ? `\n  ${t.FirstURL}` : ""}`,
+              );
           });
-          return results.length ? results.join("\n\n") : `No instant answer. Try: https://duckduckgo.com/?q=${encoded}`;
+          return results.length
+            ? results.join("\n\n")
+            : `No instant answer. Try: https://duckduckgo.com/?q=${encoded}`;
         } catch (e) {
           return `Search failed: ${e.message}`;
         }
@@ -260,10 +410,27 @@ function executeTool(name, args) {
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
 
-async function runAgent(history, onChunk, onToolCall) {
+async function runAgent(
+  history,
+  onChunk,
+  onToolCall,
+  onToolStart,
+  onToolComplete,
+) {
   // Build rich system context
   let gitContext = "";
-  try { gitContext = execSync("git -C " + WORK_DIR + " log --oneline -3 2>/dev/null && git -C " + WORK_DIR + " status --short 2>/dev/null", { encoding: "utf8", timeout: 3000 }).trim(); } catch {}
+  try {
+    const log = execFileSync(
+      "git",
+      ["-C", WORK_DIR, "log", "--oneline", "-3"],
+      { encoding: "utf8", timeout: 3000 },
+    ).trim();
+    const status = execFileSync("git", ["-C", WORK_DIR, "status", "--short"], {
+      encoding: "utf8",
+      timeout: 3000,
+    }).trim();
+    gitContext = [log, status].filter(Boolean).join("\n");
+  } catch {}
 
   const messages = [
     {
@@ -288,7 +455,9 @@ async function runAgent(history, onChunk, onToolCall) {
         `- For code changes, read the file first, then write the full updated content.`,
         `- Use web_search for docs, error messages, or anything requiring up-to-date info.`,
         `- Chain tools naturally: search → read → edit → verify.`,
-      ].filter(Boolean).join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     },
     ...history,
   ];
@@ -300,7 +469,12 @@ async function runAgent(history, onChunk, onToolCall) {
         Authorization: `Bearer ${GITHUB_TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: MODEL, messages, tools: TOOLS, stream: true }),
+      body: JSON.stringify({
+        model: MODEL,
+        messages,
+        tools: TOOLS,
+        stream: true,
+      }),
     });
 
     if (!response.ok) {
@@ -335,13 +509,17 @@ async function runAgent(history, onChunk, onToolCall) {
           if (delta.tool_calls) {
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;
-              if (!toolCalls[idx]) toolCalls[idx] = { id: "", name: "", arguments: "" };
+              if (!toolCalls[idx])
+                toolCalls[idx] = { id: "", name: "", arguments: "" };
               if (tc.id) toolCalls[idx].id = tc.id;
               if (tc.function?.name) toolCalls[idx].name = tc.function.name;
-              if (tc.function?.arguments) toolCalls[idx].arguments += tc.function.arguments;
+              if (tc.function?.arguments)
+                toolCalls[idx].arguments += tc.function.arguments;
             }
           }
-        } catch { /* skip malformed */ }
+        } catch {
+          /* skip malformed */
+        }
       }
     }
 
@@ -357,7 +535,7 @@ async function runAgent(history, onChunk, onToolCall) {
     messages.push({
       role: "assistant",
       content: assistantContent || null,
-      tool_calls: toolCallList.map(tc => ({
+      tool_calls: toolCallList.map((tc) => ({
         id: tc.id,
         type: "function",
         function: { name: tc.name, arguments: tc.arguments },
@@ -366,10 +544,18 @@ async function runAgent(history, onChunk, onToolCall) {
 
     for (const tc of toolCallList) {
       let args;
-      try { args = JSON.parse(tc.arguments); } catch { args = {}; }
+      try {
+        args = JSON.parse(tc.arguments);
+      } catch {
+        args = {};
+      }
 
+      const toolStartTime = Date.now();
       onToolCall(tc.name, args);
+      if (onToolStart) onToolStart(tc.name, args, tc.id);
       const result = executeTool(tc.name, args);
+      const elapsed = Date.now() - toolStartTime;
+      if (onToolComplete) onToolComplete(tc.name, elapsed);
 
       messages.push({
         role: "tool",
@@ -383,28 +569,42 @@ async function runAgent(history, onChunk, onToolCall) {
 
 // ─── Session store ────────────────────────────────────────────────────────────
 
-const agentSessions = new Map();   // sessionId -> [messages]
+const agentSessions = new Map(); // sessionId -> { history, status, currentTool, startedAt, lastActivityAt }
 const terminalSessions = new Map(); // tmuxSession -> { ws, timer }
 
 // ─── Tmux helpers ─────────────────────────────────────────────────────────────
 
-const PARENT = "copilot-mobile";  // all windows live inside this tmux session
+const PARENT = "copilot-mobile"; // all windows live inside this tmux session
 
 function tmuxCmd(...args) {
-  return execFileSync(TMUX, args, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  return execFileSync(TMUX, args, {
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
 }
 
 // target string for a named window: "copilot-mobile:windowname"
-function target(name) { return `${PARENT}:${name}`; }
+function target(name) {
+  return `${PARENT}:${name}`;
+}
 
 function capturePane(name) {
-  try { return execFileSync(TMUX, ["capture-pane", "-t", target(name), "-p", "-e", "-S", "-500"], { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }); }
-  catch { return null; }
+  try {
+    return execFileSync(
+      TMUX,
+      ["capture-pane", "-t", target(name), "-p", "-e", "-S", "-500"],
+      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] },
+    );
+  } catch {
+    return null;
+  }
 }
 
 function ensureParentSession() {
-  try { tmuxCmd("has-session", "-t", PARENT); return false; }
-  catch {
+  try {
+    tmuxCmd("has-session", "-t", PARENT);
+    return false;
+  } catch {
     tmuxCmd("new-session", "-d", "-s", PARENT, "-x", "220", "-y", "50");
     return true; // newly created
   }
@@ -412,27 +612,47 @@ function ensureParentSession() {
 
 function openTerminalAttached(preferred) {
   const scriptPath = "/tmp/copilot-mobile-attach.sh";
-  fs.writeFileSync(scriptPath, `#!/bin/bash\nexec ${TMUX} attach -t ${PARENT}\n`, { mode: 0o755 });
+  fs.writeFileSync(
+    scriptPath,
+    `#!/bin/bash\nexec ${TMUX} attach -t ${PARENT}\n`,
+    { mode: 0o755 },
+  );
   try {
     const lsinfo = execSync("lsappinfo list 2>/dev/null", { encoding: "utf8" });
-    const frontmostMatch = lsinfo.match(/"([^"]+)"\s+ASN:[^:]+:\s*\(in front\)/);
+    const frontmostMatch = lsinfo.match(
+      /"([^"]+)"\s+ASN:[^:]+:\s*\(in front\)/,
+    );
     const frontmost = frontmostMatch ? frontmostMatch[1] : "";
     const isRunning = (name) => lsinfo.includes(`"${name}" ASN:`);
 
-    console.log(`[terminal] Frontmost: "${frontmost}", Preferred: "${preferred || "none"}"`);
+    console.log(
+      `[terminal] Frontmost: "${frontmost}", Preferred: "${preferred || "none"}"`,
+    );
 
-    const tryOpen = (appName) => execSync(`open -a "${appName}" "${scriptPath}"`);
+    const tryOpen = (appName) =>
+      execSync(`open -a "${appName}" "${scriptPath}"`);
     const TERMINALS = ["Warp", "Ghostty", "kitty", "iTerm2", "Terminal"];
 
     // If preferred is set and is installed/running, use it
     if (preferred && (isRunning(preferred) || TERMINALS.includes(preferred))) {
-      try { tryOpen(preferred); return; } catch {}
+      try {
+        tryOpen(preferred);
+        return;
+      } catch {}
     }
     // Try frontmost if it's a terminal
-    if (TERMINALS.includes(frontmost)) { try { tryOpen(frontmost); return; } catch {} }
+    if (TERMINALS.includes(frontmost)) {
+      try {
+        tryOpen(frontmost);
+        return;
+      } catch {}
+    }
     // Try any running terminal in default order
-    const running = TERMINALS.find(t => isRunning(t));
-    if (running) { tryOpen(running); return; }
+    const running = TERMINALS.find((t) => isRunning(t));
+    if (running) {
+      tryOpen(running);
+      return;
+    }
     execSync(`open -a "Terminal" "${scriptPath}"`);
   } catch (e) {
     console.warn("Could not auto-open terminal:", e.message);
@@ -446,12 +666,16 @@ function ensureTmux(name, cwd, preferred, startCommand) {
     tmuxCmd("select-window", "-t", target(name));
     return false;
   } catch {
-    const resolvedCwd = cwd ? cwd.replace(/^~/, process.env.HOME) : process.env.HOME;
+    const resolvedCwd = cwd
+      ? cwd.replace(/^~/, process.env.HOME)
+      : process.env.HOME;
     tmuxCmd("new-window", "-t", PARENT, "-n", name, "-c", resolvedCwd);
     if (startCommand) {
       // Small delay to let shell initialize before sending command
       setTimeout(() => {
-        try { tmuxCmd("send-keys", "-t", target(name), startCommand, "Enter"); } catch {}
+        try {
+          tmuxCmd("send-keys", "-t", target(name), startCommand, "Enter");
+        } catch {}
       }, 800);
     }
     return true;
@@ -463,9 +687,9 @@ function startPolling(name, ws) {
 
   const getStatus = () => {
     const age = Date.now() - lastChangeAt;
-    if (age < 3000) return "running";      // changed in last 3s
-    if (age < 60000) return "idle";        // changed in last minute
-    return "stale";                        // no activity > 1 min
+    if (age < 3000) return "running"; // changed in last 3s
+    if (age < 60000) return "idle"; // changed in last minute
+    return "stale"; // no activity > 1 min
   };
 
   const poll = () => {
@@ -473,7 +697,14 @@ function startPolling(name, ws) {
     const content = capturePane(name);
     if (content === null) {
       if (ws.readyState === ws.OPEN)
-        ws.send(JSON.stringify({ type: "screen", sessionId: name, data: "\r\n[Session ended]\r\n", status: "ended" }));
+        ws.send(
+          JSON.stringify({
+            type: "screen",
+            sessionId: name,
+            data: "\r\n[Session ended]\r\n",
+            status: "ended",
+          }),
+        );
       terminalSessions.delete(name);
       return;
     }
@@ -481,14 +712,22 @@ function startPolling(name, ws) {
     if (content !== last) {
       lastChangeAt = Date.now();
       if (ws.readyState === ws.OPEN)
-        ws.send(JSON.stringify({ type: "screen", sessionId: name, data: content, status: "running" }));
+        ws.send(
+          JSON.stringify({
+            type: "screen",
+            sessionId: name,
+            data: content,
+            status: "running",
+          }),
+        );
       last = content;
     } else if (terminalSessions.get(name)?.lastStatus !== status) {
       // Status changed even though content didn't — notify
       if (ws.readyState === ws.OPEN)
         ws.send(JSON.stringify({ type: "status", sessionId: name, status }));
     }
-    if (terminalSessions.has(name)) terminalSessions.get(name).lastStatus = status;
+    if (terminalSessions.has(name))
+      terminalSessions.get(name).lastStatus = status;
     terminalSessions.get(name).timer = setTimeout(poll, 150);
   };
   poll();
@@ -497,67 +736,159 @@ function startPolling(name, ws) {
 // ─── WebSocket server ─────────────────────────────────────────────────────────
 
 wss.on("connection", (ws, req) => {
-  const url = new URL(req.url, "http://localhost");
-  if (url.searchParams.get("key") !== API_KEY) {
+  const clientIp = req.socket.remoteAddress || "unknown";
+  if (rateLimit(clientIp, 120)) {
+    ws.send(JSON.stringify({ type: "error", message: "Rate limited" }));
+    ws.close(1008, "Rate limited");
+    return;
+  }
+  if (extractApiKey(req) !== API_KEY) {
     ws.send(JSON.stringify({ type: "error", message: "Unauthorized" }));
     ws.close(1008, "Unauthorized");
     return;
   }
 
-  const send = (obj) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj)); };
+  const send = (obj) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  };
   console.log(`[${new Date().toISOString()}] Client connected`);
 
   ws.on("message", async (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch {
-      send({ type: "error", message: "Invalid JSON" }); return;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      send({ type: "error", message: "Invalid JSON" });
+      return;
     }
     console.log(`[msg] ${msg.type} session=${msg.sessionId || "-"}`);
 
     switch (msg.type) {
-
       // ── Ping ──
-      case "ping": send({ type: "pong" }); break;
+      case "ping":
+        send({ type: "pong" });
+        break;
 
       // ── Agent chat ──────────────────────────────────────────────────────────
       case "agent_chat": {
         const { sessionId, content } = msg;
-        if (!agentSessions.has(sessionId)) agentSessions.set(sessionId, []);
-        const history = agentSessions.get(sessionId);
-        history.push({ role: "user", content });
+        if (!agentSessions.has(sessionId)) {
+          agentSessions.set(sessionId, {
+            history: [],
+            status: "idle",
+            currentTool: null,
+            startedAt: null,
+            lastActivityAt: null,
+          });
+        }
+        const session = agentSessions.get(sessionId);
+        session.history.push({ role: "user", content });
+        session.status = "thinking";
+        session.startedAt = Date.now();
+        session.lastActivityAt = Date.now();
+        send({
+          type: "agent_status",
+          sessionId,
+          status: "thinking",
+          startedAt: session.startedAt,
+        });
 
         try {
           let fullResponse = "";
           const response = await runAgent(
-            [...history],
+            [...session.history],
             (chunk) => {
               fullResponse += chunk;
               send({ type: "agent_chunk", sessionId, content: chunk });
             },
             (toolName, toolArgs) => {
-              send({ type: "tool_call", sessionId, tool: toolName, args: toolArgs });
-            }
+              send({
+                type: "tool_call",
+                sessionId,
+                tool: toolName,
+                args: toolArgs,
+              });
+            },
+            (toolName, toolArgs, toolId) => {
+              session.status = "running_tool";
+              session.currentTool = {
+                name: toolName,
+                args: toolArgs,
+                startedAt: Date.now(),
+              };
+              session.lastActivityAt = Date.now();
+              send({
+                type: "agent_status",
+                sessionId,
+                status: "running_tool",
+                tool: toolName,
+                args: toolArgs,
+              });
+              send({
+                type: "tool_start",
+                sessionId,
+                tool: toolName,
+                args: toolArgs,
+                toolId,
+              });
+            },
+            (toolName, elapsed) => {
+              session.status = "thinking";
+              session.currentTool = null;
+              session.lastActivityAt = Date.now();
+              send({
+                type: "tool_complete",
+                sessionId,
+                tool: toolName,
+                elapsed,
+              });
+            },
           );
-          history.push({ role: "assistant", content: response });
+          session.history.push({ role: "assistant", content: response });
+          session.status = "idle";
+          session.currentTool = null;
+          session.lastActivityAt = Date.now();
           send({ type: "agent_done", sessionId });
+          send({ type: "agent_status", sessionId, status: "idle" });
         } catch (err) {
           console.error("Agent error:", err.message);
+          session.status = "idle";
+          session.currentTool = null;
+          session.lastActivityAt = Date.now();
           send({ type: "agent_error", sessionId, message: err.message });
+          send({ type: "agent_status", sessionId, status: "idle" });
         }
         break;
       }
 
       case "new_agent_session": {
         const sessionId = msg.sessionId || crypto.randomUUID();
-        agentSessions.set(sessionId, []);
+        agentSessions.set(sessionId, {
+          history: [],
+          status: "idle",
+          currentTool: null,
+          startedAt: null,
+          lastActivityAt: null,
+        });
         send({ type: "agent_session_created", sessionId });
         break;
       }
 
-      case "clear_agent_session":
-        agentSessions.set(msg.sessionId, []);
+      case "clear_agent_session": {
+        if (agentSessions.has(msg.sessionId)) {
+          agentSessions.get(msg.sessionId).history = [];
+        } else {
+          agentSessions.set(msg.sessionId, {
+            history: [],
+            status: "idle",
+            currentTool: null,
+            startedAt: null,
+            lastActivityAt: null,
+          });
+        }
         send({ type: "agent_session_cleared", sessionId: msg.sessionId });
         break;
+      }
 
       // ── Terminal (tmux) ─────────────────────────────────────────────────────
       case "new_session": {
@@ -584,20 +915,29 @@ wss.on("connection", (ws, req) => {
         const data = msg.data || "";
         try {
           if (data === "\u0003") tmuxCmd("send-keys", "-t", target(sid), "C-c");
-          else if (data === "\t") tmuxCmd("send-keys", "-t", target(sid), "Tab");
+          else if (data === "\t")
+            tmuxCmd("send-keys", "-t", target(sid), "Tab");
           else {
             const text = data.replace(/[\r\n]+$/, "");
             const hasNl = data !== text;
-            if (text) { const esc = text.replace(/'/g, "'\\''"); tmuxCmd("send-keys", "-t", target(sid), `'${esc}'`); }
+            if (text) {
+              const esc = text.replace(/'/g, "'\\''");
+              tmuxCmd("send-keys", "-t", target(sid), `'${esc}'`);
+            }
             if (hasNl) tmuxCmd("send-keys", "-t", target(sid), "Enter");
           }
-        } catch (e) { send({ type: "error", message: e.message }); }
+        } catch (e) {
+          send({ type: "error", message: e.message });
+        }
         break;
       }
 
       case "close_session": {
         const s = terminalSessions.get(msg.sessionId);
-        if (s) { clearTimeout(s.timer); terminalSessions.delete(msg.sessionId); }
+        if (s) {
+          clearTimeout(s.timer);
+          terminalSessions.delete(msg.sessionId);
+        }
         break;
       }
 
@@ -608,31 +948,68 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     for (const [id, s] of terminalSessions) {
-      if (s.ws === ws) { clearTimeout(s.timer); terminalSessions.delete(id); }
+      if (s.ws === ws) {
+        clearTimeout(s.timer);
+        terminalSessions.delete(id);
+      }
     }
     console.log(`[${new Date().toISOString()}] Client disconnected`);
   });
 });
 
+app.get("/api/agent-sessions", (req, res) => {
+  if (extractApiKey(req) !== API_KEY)
+    return res.status(401).json({ error: "Unauthorized" });
+  const sessions = Array.from(agentSessions.entries()).map(([id, s]) => ({
+    sessionId: id,
+    status: s.status || "idle",
+    currentTool: s.currentTool || null,
+    messageCount: (s.history || s).length,
+    startedAt: s.startedAt || null,
+    lastActivityAt: s.lastActivityAt || null,
+  }));
+  res.json({ sessions });
+});
+
 app.get("/api/terminals", (req, res) => {
-  if (req.query.key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  if (extractApiKey(req) !== API_KEY)
+    return res.status(401).json({ error: "Unauthorized" });
   const KNOWN = [
-    { name: "Warp",     bundle: "Warp.app" },
-    { name: "Ghostty",  bundle: "Ghostty.app" },
-    { name: "kitty",    bundle: "kitty.app" },
-    { name: "iTerm2",   bundle: "iTerm.app" },
+    { name: "Warp", bundle: "Warp.app" },
+    { name: "Ghostty", bundle: "Ghostty.app" },
+    { name: "kitty", bundle: "kitty.app" },
+    { name: "iTerm2", bundle: "iTerm.app" },
     { name: "Terminal", bundle: "Terminal.app" },
   ];
   const isInstalled = (bundle) => {
-    const paths = [`/Applications/${bundle}`, `/System/Applications/${bundle}`, `/System/Applications/Utilities/${bundle}`];
-    return paths.some(p => { try { fs.accessSync(p); return true; } catch { return false; } });
+    const paths = [
+      `/Applications/${bundle}`,
+      `/System/Applications/${bundle}`,
+      `/System/Applications/Utilities/${bundle}`,
+    ];
+    return paths.some((p) => {
+      try {
+        fs.accessSync(p);
+        return true;
+      } catch {
+        return false;
+      }
+    });
   };
-  const terminals = KNOWN.filter(t => isInstalled(t.bundle)).map(t => t.name);
+  const terminals = KNOWN.filter((t) => isInstalled(t.bundle)).map(
+    (t) => t.name,
+  );
   res.json({ terminals });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", model: MODEL, agentSessions: agentSessions.size, terminalSessions: terminalSessions.size, uptime: process.uptime() });
+  res.json({
+    status: "ok",
+    model: MODEL,
+    agentSessions: agentSessions.size,
+    terminalSessions: terminalSessions.size,
+    uptime: process.uptime(),
+  });
 });
 
 const PORT = parseInt(process.env.PORT || "3003", 10);
@@ -645,7 +1022,9 @@ server.listen(PORT, () => {
   if (DEFAULT_START_COMMAND) {
     try {
       ensureTmux("copilot", WORK_DIR, null, DEFAULT_START_COMMAND);
-      console.log(`   Auto-started session "copilot" with: ${DEFAULT_START_COMMAND}`);
+      console.log(
+        `   Auto-started session "copilot" with: ${DEFAULT_START_COMMAND}`,
+      );
     } catch (e) {
       console.warn("   Could not auto-start session:", e.message);
     }

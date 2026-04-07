@@ -14,8 +14,8 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            if settings.isConfigured, let url = settings.wsURL {
-                ws.connect(to: url)
+            if settings.isConfigured, let request = settings.wsRequest {
+                ws.connect(to: request)
             }
         }
     }

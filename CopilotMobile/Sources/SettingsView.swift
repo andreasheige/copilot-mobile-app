@@ -116,8 +116,8 @@ struct SettingsView: View {
     private func save() {
         settings.serverURL = serverURLDraft
         settings.apiKey = apiKeyDraft
-        if let url = settings.wsURL {
-            ws.connect(to: url)
+        if let request = settings.wsRequest {
+            ws.connect(to: request)
         }
         isPresented = false
     }
@@ -208,10 +208,10 @@ struct TerminalOrderView: View {
         isLoading = true
         let urlStr = settings.serverURL.trimmingCharacters(in: .whitespaces)
         guard let base = URL(string: urlStr) else { isLoading = false; return }
-        let encoded = settings.apiKey.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? settings.apiKey
-        let url = base.appendingPathComponent("api/terminals").absoluteString + "?key=\(encoded)"
-        guard let finalURL = URL(string: url) else { isLoading = false; return }
-        URLSession.shared.dataTask(with: finalURL) { data, _, _ in
+        let terminalsURL = base.appendingPathComponent("api/terminals")
+        var request = URLRequest(url: terminalsURL)
+        request.setValue(settings.apiKey, forHTTPHeaderField: "X-API-Key")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             DispatchQueue.main.async {
                 isLoading = false
                 guard let data,
